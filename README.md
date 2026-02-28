@@ -106,6 +106,15 @@ python3 aes_cbc_poa.py \
 
 Forgery builds blocks sequentially (last-to-first) but guesses within each byte position in parallel. With 16 forge threads (default), typical forge takes ~5-8 minutes. The forged token is verified against the oracle before output.
 
+After successful forgery, the tool outputs a ready-to-use password reset URL:
+
+```
+[+] Password Reset URL:
+    https://portal.example.com/s/confirmation-link-is-expired?retURL=ForgotPassword%3Fparams%3D...
+```
+
+Open this URL in a browser to complete the password reset for the target account.
+
 ### All Options
 
 | Flag | Description | Default |
