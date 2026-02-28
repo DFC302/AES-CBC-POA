@@ -489,8 +489,8 @@ Examples:
             sys.exit(1)
 
         # Build ready-to-use password reset URL
-        params_encoded = urllib.parse.quote(token_b64, safe='')
-        ret_url_inner = f"ForgotPassword?params={params_encoded}&country=IE&language=en_IE&source=reset"
+        # Single-encode the full retURL value (matching Salesforce email link format)
+        ret_url_inner = f"ForgotPassword?params={token_b64}&country=IE&language=en_IE&source=reset"
         ret_url_encoded = urllib.parse.quote(ret_url_inner, safe='')
         reset_url = f"https://{args.host}/s/confirmation-link-is-expired?retURL={ret_url_encoded}"
 
